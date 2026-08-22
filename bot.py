@@ -97,50 +97,73 @@ def force_sub_text(name: str) -> str:
     )
 
 
+SEP = "➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖"
+
+
 def build_stats_text(stats: dict) -> str:
     lines = [
-        "📊 إحصائيات البوت\n",
-        "👥 المستخدمون",
-        f"• الإجمالي: {stats['total_users']}",
-        f"• نشطون الآن: {stats['active_now']}",
-        f"• نشطون آخر 7 أيام: {stats['active_7d']}",
-        f"• نشطون آخر 30 يوم: {stats['active_30d']}",
-        f"• مشتركون بالقناة (بحسب آخر تحقق): {stats['subscribed_count']}",
+        "📊 <b>لوحة إحصائيات بوت VONE</b>",
+        SEP,
         "",
-        "🌍 أبرز اللغات لدى المستخدمين",
+        "👥 <b>المستخدمون</b>",
+        f"🟢 نشطون الآن: <b>{stats['active_now']}</b>",
+        f"👤 إجمالي المستخدمين: <b>{stats['total_users']}</b>",
+        f"📈 نشطون آخر 7 أيام: <b>{stats['active_7d']}</b>",
+        f"📈 نشطون آخر 30 يوم: <b>{stats['active_30d']}</b>",
+        f"📺 مشتركون بالقناة (آخر تحقق): <b>{stats['subscribed_count']}</b>",
+        "",
+        SEP,
+        "",
+        "🌍 <b>أبرز اللغات لدى المستخدمين</b>",
     ]
     if stats["top_languages"]:
         total = stats["total_users"] or 1
         for lang, count in stats["top_languages"]:
             pct = count / total * 100
-            lines.append(f"• {lang}: {count} ({pct:.1f}%)")
+            lines.append(f"▫️ {lang}: <b>{count}</b> ({pct:.1f}%)")
     else:
-        lines.append("• لا توجد بيانات كافية بعد")
+        lines.append("▫️ لا توجد بيانات كافية بعد")
 
     lines += [
         "",
-        "📨 الطلبات",
-        f"• إجمالي الطلبات: {stats['total_requests']}",
-        f"• نسبة نجاح البوت: {stats['success_rate']:.1f}%",
+        SEP,
         "",
-        "ℹ️ ملاحظة: تيليجرام لا يوفّر بيانات دولة حقيقية للمستخدم، لذلك تم استخدام"
-        " لغة تطبيق المستخدم كأقرب تقريب متاح بدل الدولة الفعلية.",
+        "📨 <b>الطلبات</b>",
+        f"📥 إجمالي الطلبات: <b>{stats['total_requests']}</b>",
+        f"✅ نسبة نجاح البوت: <b>{stats['success_rate']:.1f}%</b>",
+        "",
+        SEP,
+        "",
+        "ℹ️ لغة المستخدم تُستخدم كأقرب تقريب متاح بدل الدولة الفعلية"
+        " (تيليجرام لا يوفّر بيانات دولة حقيقية عبر الـ API).",
+        "",
+        f"🕒 آخر تحديث: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
     ]
     return "\n".join(lines)
 
 
 async def send_stats(bot, chat_id: int, message_id: int = None):
+    from telegram.constants import ParseMode
+
     stats = db.get_stats()
     text = build_stats_text(stats)
     if message_id:
         try:
             await bot.edit_message_text(
-                chat_id=chat_id, message_id=message_id, text=text, reply_markup=stats_keyboard()
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=stats_keyboard(),
+                parse_mode=ParseMode.HTML,
             )
-            return
-        except BadRequest:
-            pass  # النص لم يتغيّر مثلاً، نتجاهل ونكمل
-    await bot.send_message(chat_id=chat_id, text=text, reply_markup=stats_keyboard())
+        except BadRequest as e:
+            # "Message is not modified" يعني الأرقام لم تتغيّر منذ آخر تحديث — هذا طبيعي، لا نرسل رسالة جديدة
+            if "not modified" not in str(e).lower():
+                logger.warning("فشل تحديث رسالة الإحصائيات: %s", e)
+        return
+    await bot.send_message(
+        chat_id=chat_id, text=text, reply_markup=stats_keyboard(), parse_mode=ParseMode.HTML
+    )
 
 
 # ------------------------------------------------------------------
@@ -188,13 +211,21 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # أي زر آخر غير "تحقق" يتطلب أن يكون المستخدم مشتركاً فعلاً
-    if not await is_subscribed(context.bot, user.id):
+    # أي زر آخر غير "تحقق" يتطلب أن يكون المستخدم مشتركاً فعلاً (الأدمن مستثنى)
+    if user.id != config.ADMIN_ID and not await is_subscribed(context.bot, user.id):
         await query.answer("يجب الاشتراك في القناة أولاً ❌", show_alert=True)
         try:
             await query.edit_message_text(force_sub_text(name), reply_markup=subscribe_keyboard())
         except BadRequest:
             pass
+        return
+
+    if data == "admin_stats_refresh":
+        if user.id != config.ADMIN_ID:
+            await query.answer("هذا الأمر للأدمن فقط ❌", show_alert=True)
+            return
+        await query.answer("تم التحديث 🔄")
+        await send_stats(context.bot, query.message.chat_id, query.message.message_id)
         return
 
     await query.answer()
@@ -288,13 +319,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             favs = set(db.get_favorites(user.id))
             await query.edit_message_reply_markup(reply_markup=voices_list_keyboard(page, favs))
-        return
-
-    if data == "admin_stats_refresh":
-        if user.id != config.ADMIN_ID:
-            await query.answer("هذا الأمر للأدمن فقط ❌", show_alert=True)
-            return
-        await send_stats(context.bot, query.message.chat_id, query.message.message_id)
         return
 
 
