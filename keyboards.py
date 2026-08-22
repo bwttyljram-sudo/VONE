@@ -19,15 +19,15 @@ from config import VOICES_PER_PAGE, CHANNEL_LINK
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("قائمة الأصوات 🔊", callback_data="menu_voices")],
-        [InlineKeyboardButton("الأصوات المُفضلة 💙", callback_data="menu_fav")],
+        [InlineKeyboardButton("قائمة الأصوات 🔊", callback_data="menu_voices", style="primary")],
+        [InlineKeyboardButton("الأصوات المُفضلة 💙", callback_data="menu_fav", style="primary")],
     ])
 
 
 def subscribe_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("أشترك في القناة 📺", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub")],
+        [InlineKeyboardButton("أشترك في القناة 📺", url=CHANNEL_LINK, style="danger")],
+        [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub", style="primary")],
     ])
 
 
@@ -91,5 +91,5 @@ def favorites_list_keyboard(page: int, favorite_voice_ids: list):
 
 def stats_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("تحديث 🔄", callback_data="admin_stats_refresh")],
+        [InlineKeyboardButton("تحديث 🔄", callback_data="admin_stats_refresh", style="primary")],
     ])
