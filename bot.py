@@ -689,23 +689,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in ("إحصائيات", "احصائيات"):
             await send_stats(context.bot, user.id)
             return
-if text in ("فحص النموذج", "فحص_النموذج"):
-            await update.message.reply_text("🔍 جارٍ فحص واجهة النموذج، ثواني...")
-            try:
-                import json
-                from gradio_client import Client
-
-                def _inspect():
-                    client = Client("ACE-Step/Ace-Step-v1.5")
-                    return client.view_api(all_endpoints=True, print_info=False, return_format="dict")
-
-                endpoints = await asyncio.to_thread(_inspect)
-                result_text = json.dumps(endpoints, indent=2, ensure_ascii=False)
-            except Exception as e:
-                result_text = f"فشل الفحص: {e}"
-
-            for i in range(0, len(result_text), 3500):
-                await update.message.reply_text(f"```\n{result_text[i:i+3500]}\n```", parse_mode="Markdown")
             return
     
         if text in ("إذاعة", "اذاعة"):
@@ -813,7 +796,25 @@ async def do_broadcast(bot, admin_id: int, source_message):
 # ------------------------------------------------------------------
 # الإعداد والتشغيل
 # ------------------------------------------------------------------
+async def inspect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.ADMIN_ID:
+        return
+    await update.message.reply_text("🔍 جارٍ فحص واجهة النموذج، ثواني...")
+    try:
+        import json
+        from gradio_client import Client
 
+        def _inspect():
+            client = Client("ACE-Step/Ace-Step-v1.5")
+            return client.view_api(all_endpoints=True, print_info=False, return_format="dict")
+
+        endpoints = await asyncio.to_thread(_inspect)
+        result_text = json.dumps(endpoints, indent=2, ensure_ascii=False)
+    except Exception as e:
+        result_text = f"فشل الفحص: {e}"
+
+    for i in range(0, len(result_text), 3500):
+        await update.message.reply_text(f"```\n{result_text[i:i+3500]}\n```", parse_mode="Markdown")
 async def post_init(application: Application):
     await application.bot.set_my_commands([BotCommand("start", "بدء استخدام البوت")])
 
@@ -831,6 +832,7 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("inspect", inspect_command))
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
