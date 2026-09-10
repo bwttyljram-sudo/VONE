@@ -1,6 +1,9 @@
 """
 VONE — بوت تيليجرام لتحويل النص إلى صوت باستخدام أصوات عربية مجانية من Microsoft Edge TTS.
 
+هذا الملف يجمع كل شي بمكان واحد (الإعدادات + قاعدة البيانات + الأصوات + الأزرار + منطق البوت)
+عشان يكون التعامل مع المشروع أبسط — بدون أي تغيير بالمنطق أو السلوك عن النسخة المقسّمة.
+
 المميزات:
 - اشتراك إجباري بالقناة قبل الاستخدام.
 - قائمة أصوات مقسّمة على صفحات (10 لكل صفحة) مع أزرار "التالي/السابق".
@@ -10,15 +13,18 @@ VONE — بوت تيليجرام لتحويل النص إلى صوت باستخ�
 - حماية: حد تزامن لعمليات التحويل + تهدئة لكل مستخدم + حد لطول النص.
 """
 
-import asyncio
+import os
 import io
-import logging
-import threading
 import time
+import asyncio
+import logging
+import sqlite3
+import threading
+from contextlib import contextmanager
 
 import edge_tts
-from telegram import Update, BotCommand
-from telegram.constants import ChatMemberStatus, ChatAction
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus, ChatAction, ParseMode
 from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
     Application,
@@ -30,16 +36,6 @@ from telegram.ext import (
     filters,
 )
 
-import config
-import database as db
-from voices import VOICES, get_voice
-from keyboards import (
-    main_menu_keyboard,
-    subscribe_keyboard,
-    voices_list_keyboard,
-    favorites_list_keyboard,
-    stats_keyboard,
-)
 from server import run_server
 
 logging.basicConfig(
@@ -47,10 +43,373 @@ logging.basicConfig(
 )
 logger = logging.getLogger("vone_bot")
 
-# يحدّ من عدد عمليات التحويل التي تُنفَّذ في نفس اللحظة على مستوى البوت كله
-tts_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TTS)
 
-# آخر وقت طلب لكل مستخدم (تهدئة ضد السبام)، مخزّن في الذاكرة فقط
+# ====================================================================
+# 1) الإعدادات — كل القيم الحساسة تُقرأ من متغيرات البيئة (Render → Environment)
+# ====================================================================
+
+class config:
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+    ADMIN_ID = int(os.environ.get("ADMIN_ID", "6043858925"))
+    CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@ZenoX_Tools").strip()
+    CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/ZenoX_Tools").strip()
+    PORT = int(os.environ.get("PORT", "10000"))
+    DB_PATH = os.environ.get("DB_PATH", "bot_database.db")
+
+    MAX_CONCURRENT_TTS = 5
+    PER_USER_COOLDOWN_SECONDS = 3
+    MAX_TEXT_LENGTH = 2000
+    BROADCAST_DELAY_SECONDS = 0.05
+    VOICES_PER_PAGE = 10
+    ACTIVE_NOW_WINDOW_MINUTES = 5
+
+
+# ====================================================================
+# 2) الأصوات العربية المتوفّرة من Microsoft Edge TTS
+# ====================================================================
+
+VOICES = [
+    {"id": "ar-SA-HamedNeural",   "name": "حامد (السعودية)",   "emoji": "🧔🏻"},
+    {"id": "ar-SA-ZariyahNeural", "name": "زارية (السعودية)",  "emoji": "👩🏻‍🦳"},
+    {"id": "ar-EG-ShakirNeural",  "name": "شاكر (مصر)",        "emoji": "🧔🏻"},
+    {"id": "ar-EG-SalmaNeural",   "name": "سلمى (مصر)",        "emoji": "👩🏻‍🦳"},
+    {"id": "ar-AE-HamdanNeural",  "name": "حمدان (الإمارات)",   "emoji": "🧔🏻"},
+    {"id": "ar-AE-FatimaNeural",  "name": "فاطمة (الإمارات)",   "emoji": "👩🏻‍🦳"},
+    {"id": "ar-BH-AliNeural",     "name": "علي (البحرين)",      "emoji": "🧔🏻"},
+    {"id": "ar-BH-LailaNeural",   "name": "ليلى (البحرين)",     "emoji": "👩🏻‍🦳"},
+    {"id": "ar-DZ-IsmaelNeural",  "name": "إسماعيل (الجزائر)",  "emoji": "🧔🏻"},
+    {"id": "ar-DZ-AminaNeural",   "name": "أمينة (الجزائر)",    "emoji": "👩🏻‍🦳"},
+    {"id": "ar-IQ-BasselNeural",  "name": "باسل (العراق)",      "emoji": "🧔🏻"},
+    {"id": "ar-IQ-RanaNeural",    "name": "رنا (العراق)",       "emoji": "👩🏻‍🦳"},
+    {"id": "ar-JO-TaimNeural",    "name": "طيم (الأردن)",       "emoji": "🧔🏻"},
+    {"id": "ar-JO-SanaNeural",    "name": "سناء (الأردن)",      "emoji": "👩🏻‍🦳"},
+    {"id": "ar-KW-FahedNeural",   "name": "فهد (الكويت)",       "emoji": "🧔🏻"},
+    {"id": "ar-KW-NouraNeural",   "name": "نورة (الكويت)",      "emoji": "👩🏻‍🦳"},
+    {"id": "ar-LB-RamiNeural",    "name": "رامي (لبنان)",       "emoji": "🧔🏻"},
+    {"id": "ar-LB-LaylaNeural",   "name": "ليلى (لبنان)",       "emoji": "👩🏻‍🦳"},
+    {"id": "ar-LY-OmarNeural",    "name": "عمر (ليبيا)",        "emoji": "🧔🏻"},
+    {"id": "ar-LY-ImanNeural",    "name": "إيمان (ليبيا)",      "emoji": "👩🏻‍🦳"},
+    {"id": "ar-MA-JamalNeural",   "name": "جمال (المغرب)",      "emoji": "🧔🏻"},
+    {"id": "ar-MA-MounaNeural",   "name": "منى (المغرب)",       "emoji": "👩🏻‍🦳"},
+    {"id": "ar-OM-AbdullahNeural","name": "عبدالله (عُمان)",    "emoji": "🧔🏻"},
+    {"id": "ar-OM-AyshaNeural",   "name": "عائشة (عُمان)",      "emoji": "👩🏻‍🦳"},
+    {"id": "ar-QA-MoazNeural",    "name": "معاذ (قطر)",         "emoji": "🧔🏻"},
+    {"id": "ar-QA-AmalNeural",    "name": "أمل (قطر)",          "emoji": "👩🏻‍🦳"},
+    {"id": "ar-SY-LaithNeural",   "name": "ليث (سوريا)",        "emoji": "🧔🏻"},
+    {"id": "ar-SY-AmanyNeural",   "name": "أماني (سوريا)",      "emoji": "👩🏻‍🦳"},
+    {"id": "ar-TN-HediNeural",    "name": "هادي (تونس)",        "emoji": "🧔🏻"},
+    {"id": "ar-TN-ReemNeural",    "name": "ريم (تونس)",         "emoji": "👩🏻‍🦳"},
+    {"id": "ar-YE-SalehNeural",   "name": "صالح (اليمن)",       "emoji": "🧔🏻"},
+    {"id": "ar-YE-MaryamNeural",  "name": "مريم (اليمن)",       "emoji": "👩🏻‍🦳"},
+]
+
+VOICES_BY_ID = {v["id"]: v for v in VOICES}
+
+
+def get_voice(voice_id: str):
+    return VOICES_BY_ID.get(voice_id)
+
+
+# ====================================================================
+# 3) قاعدة البيانات — SQLite بسيطة وخفيفة
+# ====================================================================
+
+_db_lock = threading.Lock()
+
+
+def _db_connect():
+    conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+
+@contextmanager
+def _get_conn():
+    with _db_lock:
+        conn = _db_connect()
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
+class db:
+    @staticmethod
+    def init_db():
+        with _get_conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    language_code TEXT,
+                    joined_at REAL,
+                    last_active REAL,
+                    selected_voice TEXT,
+                    is_subscribed INTEGER DEFAULT 0
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS favorites (
+                    user_id INTEGER,
+                    voice_id TEXT,
+                    PRIMARY KEY (user_id, voice_id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    created_at REAL,
+                    success INTEGER
+                )
+            """)
+
+    # ---------------- المستخدمون ----------------
+
+    @staticmethod
+    def upsert_user(user_id: int, username: str, language_code: str):
+        now = time.time()
+        with _get_conn() as conn:
+            cur = conn.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+            exists = cur.fetchone() is not None
+            if exists:
+                conn.execute(
+                    "UPDATE users SET username=?, language_code=?, last_active=? WHERE user_id=?",
+                    (username, language_code, now, user_id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO users (user_id, username, language_code, joined_at, last_active, selected_voice) "
+                    "VALUES (?, ?, ?, ?, ?, NULL)",
+                    (user_id, username, language_code, now, now),
+                )
+        return not exists
+
+    @staticmethod
+    def touch_user(user_id: int):
+        with _get_conn() as conn:
+            conn.execute("UPDATE users SET last_active=? WHERE user_id=?", (time.time(), user_id))
+
+    @staticmethod
+    def set_selected_voice(user_id: int, voice_id: str):
+        with _get_conn() as conn:
+            conn.execute("UPDATE users SET selected_voice=? WHERE user_id=?", (voice_id, user_id))
+
+    @staticmethod
+    def get_selected_voice(user_id: int):
+        with _get_conn() as conn:
+            cur = conn.execute("SELECT selected_voice FROM users WHERE user_id=?", (user_id,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    @staticmethod
+    def set_subscribed(user_id: int, subscribed: bool):
+        with _get_conn() as conn:
+            conn.execute(
+                "UPDATE users SET is_subscribed=? WHERE user_id=?",
+                (1 if subscribed else 0, user_id),
+            )
+
+    @staticmethod
+    def get_all_user_ids():
+        with _get_conn() as conn:
+            cur = conn.execute("SELECT user_id FROM users")
+            return [r[0] for r in cur.fetchall()]
+
+    @staticmethod
+    def remove_user(user_id: int):
+        with _get_conn() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM favorites WHERE user_id=?", (user_id,))
+
+    # ---------------- المفضلة ----------------
+
+    @staticmethod
+    def toggle_favorite(user_id: int, voice_id: str) -> bool:
+        with _get_conn() as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND voice_id=?", (user_id, voice_id)
+            )
+            if cur.fetchone():
+                conn.execute(
+                    "DELETE FROM favorites WHERE user_id=? AND voice_id=?", (user_id, voice_id)
+                )
+                return False
+            else:
+                conn.execute(
+                    "INSERT INTO favorites (user_id, voice_id) VALUES (?, ?)", (user_id, voice_id)
+                )
+                return True
+
+    @staticmethod
+    def get_favorites(user_id: int):
+        with _get_conn() as conn:
+            cur = conn.execute("SELECT voice_id FROM favorites WHERE user_id=?", (user_id,))
+            return [r[0] for r in cur.fetchall()]
+
+    @staticmethod
+    def is_favorite(user_id: int, voice_id: str) -> bool:
+        with _get_conn() as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND voice_id=?", (user_id, voice_id)
+            )
+            return cur.fetchone() is not None
+
+    # ---------------- سجل الطلبات والإحصائيات ----------------
+
+    @staticmethod
+    def log_request(user_id: int, success: bool):
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO requests (user_id, created_at, success) VALUES (?, ?, ?)",
+                (user_id, time.time(), 1 if success else 0),
+            )
+
+    @staticmethod
+    def get_stats():
+        now = time.time()
+        day = 86400
+        with _get_conn() as conn:
+            total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+            active_now = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE last_active >= ?",
+                (now - config.ACTIVE_NOW_WINDOW_MINUTES * 60,),
+            ).fetchone()[0]
+
+            active_7d = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE last_active >= ?", (now - 7 * day,)
+            ).fetchone()[0]
+
+            active_30d = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE last_active >= ?", (now - 30 * day,)
+            ).fetchone()[0]
+
+            subscribed_count = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE is_subscribed=1"
+            ).fetchone()[0]
+
+            total_requests = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+            success_requests = conn.execute(
+                "SELECT COUNT(*) FROM requests WHERE success=1"
+            ).fetchone()[0]
+            success_rate = (success_requests / total_requests * 100) if total_requests else 100.0
+
+            lang_rows = conn.execute(
+                "SELECT language_code, COUNT(*) c FROM users "
+                "WHERE language_code IS NOT NULL GROUP BY language_code ORDER BY c DESC LIMIT 5"
+            ).fetchall()
+            top_languages = [(row[0] or "غير معروف", row[1]) for row in lang_rows]
+
+        return {
+            "total_users": total_users,
+            "active_now": active_now,
+            "active_7d": active_7d,
+            "active_30d": active_30d,
+            "subscribed_count": subscribed_count,
+            "total_requests": total_requests,
+            "success_rate": success_rate,
+            "top_languages": top_languages,
+        }
+
+
+# ====================================================================
+# 4) الأزرار (Inline Keyboards)
+# ====================================================================
+#
+# تنسيق بيانات الأزرار (callback_data) موحّد وقصير حتى لا يتجاوز حد تيليجرام (64 بايت):
+#   vlist:{page}                      -> تصفح قائمة كل الأصوات
+#   vfav:{page}                       -> تصفح قائمة الأصوات المفضلة
+#   vsel:{origin}:{page}:{voice_id}   -> اختيار صوت معيّن كصوت نشط
+#   vtog:{origin}:{page}:{voice_id}   -> إضافة/حذف من المفضلة
+#   menu_voices / menu_fav / back_main
+#   check_sub
+#   admin_stats_refresh
+
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("قائمة الأصوات 🔊", callback_data="menu_voices", style="primary")],
+        [InlineKeyboardButton("الأصوات المُفضلة 💙", callback_data="menu_fav", style="primary")],
+    ])
+
+
+def subscribe_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("أشترك في القناة 📺", url=config.CHANNEL_LINK, style="danger")],
+        [InlineKeyboardButton("تحقق 🔍", callback_data="check_sub", style="primary")],
+    ])
+
+
+def _paginate(items, page):
+    start = page * config.VOICES_PER_PAGE
+    end = start + config.VOICES_PER_PAGE
+    return items[start:end], len(items)
+
+
+def voices_list_keyboard(page: int, favorites: set):
+    """قائمة كل الأصوات مع زر تفعيل + زر تبديل المفضلة لكل صوت."""
+    page_items, total = _paginate(VOICES, page)
+    rows = []
+    for v in page_items:
+        is_fav = v["id"] in favorites
+        heart = "💙" if is_fav else "🤍"
+        rows.append([
+            InlineKeyboardButton(
+                f"{v['emoji']} {v['name']}", callback_data=f"vsel:list:{page}:{v['id']}"
+            ),
+            InlineKeyboardButton(
+                heart, callback_data=f"vtog:list:{page}:{v['id']}"
+            ),
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("« السابق", callback_data=f"vlist:{page - 1}"))
+    if (page + 1) * config.VOICES_PER_PAGE < total:
+        nav_row.append(InlineKeyboardButton("التالي »", callback_data=f"vlist:{page + 1}"))
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def favorites_list_keyboard(page: int, favorite_voice_ids: list):
+    fav_voices = [v for v in VOICES if v["id"] in favorite_voice_ids]
+    page_items, total = _paginate(fav_voices, page)
+    rows = []
+    for v in page_items:
+        rows.append([
+            InlineKeyboardButton(
+                f"{v['emoji']} {v['name']} 💙", callback_data=f"vsel:fav:{page}:{v['id']}"
+            ),
+            InlineKeyboardButton("✖️", callback_data=f"vtog:fav:{page}:{v['id']}"),
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("« السابق", callback_data=f"vfav:{page - 1}"))
+    if (page + 1) * config.VOICES_PER_PAGE < total:
+        nav_row.append(InlineKeyboardButton("التالي »", callback_data=f"vfav:{page + 1}"))
+    if nav_row:
+        rows.append(nav_row)
+
+    rows.append([InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def stats_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("تحديث 🔄", callback_data="admin_stats_refresh", style="primary")],
+    ])
+
+
+# ====================================================================
+# 5) منطق البوت
+# ====================================================================
+
+tts_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TTS)
 _last_request_time = {}
 
 
@@ -143,8 +502,6 @@ def build_stats_text(stats: dict) -> str:
 
 
 async def send_stats(bot, chat_id: int, message_id: int = None):
-    from telegram.constants import ParseMode
-
     stats = db.get_stats()
     text = build_stats_text(stats)
     if message_id:
@@ -157,7 +514,6 @@ async def send_stats(bot, chat_id: int, message_id: int = None):
                 parse_mode=ParseMode.HTML,
             )
         except BadRequest as e:
-            # "Message is not modified" يعني الأرقام لم تتغيّر منذ آخر تحديث — هذا طبيعي، لا نرسل رسالة جديدة
             if "not modified" not in str(e).lower():
                 logger.warning("فشل تحديث رسالة الإحصائيات: %s", e)
         return
@@ -196,7 +552,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db.touch_user(user.id)
 
-    # ---- التحقق من الاشتراك ----
     if data == "check_sub":
         subscribed = await is_subscribed(context.bot, user.id)
         if not subscribed:
@@ -211,7 +566,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # أي زر آخر غير "تحقق" يتطلب أن يكون المستخدم مشتركاً فعلاً (الأدمن مستثنى)
     if user.id != config.ADMIN_ID and not await is_subscribed(context.bot, user.id):
         await query.answer("يجب الاشتراك في القناة أولاً ❌", show_alert=True)
         try:
@@ -245,8 +599,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_fav":
         fav_ids = db.get_favorites(user.id)
         if not fav_ids:
-            from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-
             kb = InlineKeyboardMarkup(
                 [[InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")]]
             )
@@ -282,7 +634,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         db.set_selected_voice(user.id, voice_id)
         await query.answer(f"تم اختيار الصوت: {voice['name']} {voice['emoji']} ✅")
-        # نبقي نفس القائمة ظاهرة، فقط نحدّث نص الرأس ليدل على الصوت المفعّل
         favs = set(db.get_favorites(user.id))
         header = (
             f"✅ الصوت الحالي: {voice['emoji']} {voice['name']}\n"
@@ -304,12 +655,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(page)
         if origin == "fav":
             fav_ids = db.get_favorites(user.id)
-            # لو صارت الصفحة فاضية بعد الحذف نرجع صفحة للخلف
             if page > 0 and page * config.VOICES_PER_PAGE >= len(fav_ids):
                 page -= 1
             if not fav_ids:
-                from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-
                 kb = InlineKeyboardMarkup(
                     [[InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")]]
                 )
@@ -332,7 +680,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.upsert_user(user.id, user.username or "", user.language_code or "")
     db.touch_user(user.id)
 
-    # ---- أوامر الأدمن النصية ----
     if user.id == config.ADMIN_ID:
         if context.user_data.get("awaiting_broadcast"):
             context.user_data["awaiting_broadcast"] = False
@@ -350,13 +697,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # ---- التحقق من الاشتراك للمستخدم العادي ----
     name = user.first_name or "صديقنا"
     if not await is_subscribed(context.bot, user.id):
         await update.message.reply_text(force_sub_text(name), reply_markup=subscribe_keyboard())
         return
 
-    # ---- التحقق من اختيار صوت مسبقاً ----
     voice_id = db.get_selected_voice(user.id)
     voice = get_voice(voice_id) if voice_id else None
     if not voice:
@@ -365,7 +710,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---- تهدئة ضد السبام ----
     now = time.time()
     last = _last_request_time.get(user.id, 0)
     if now - last < config.PER_USER_COOLDOWN_SECONDS:
