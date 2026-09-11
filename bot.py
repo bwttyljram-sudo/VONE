@@ -1,21 +1,20 @@
 """
-VONE — بوت تيليجرام لتحويل النص إلى صوت باستخدام أصوات عربية مجانية من Microsoft Edge TTS.
+VONE — بوت تيليجرام لتحويل النص إلى صوت (Microsoft Edge TTS) + إزالة خلفية الصور (rembg).
 
-هذا الملف يجمع كل شي بمكان واحد (الإعدادات + قاعدة البيانات + الأصوات + الأزرار + منطق البوت)
-عشان يكون التعامل مع المشروع أبسط.
+هذا الملف يجمع كل شي بمكان واحد (الإعدادات + قاعدة البيانات + الأصوات + الأزرار + منطق البوت).
 
 المميزات:
 - اشتراك إجباري بالقناة قبل الاستخدام.
 - قائمة أصوات مقسّمة على صفحات (10 لكل صفحة) مع أزرار "التالي/السابق".
 - قائمة أصوات مفضّلة لكل مستخدم.
 - تحويل النص المُرسل إلى ملف صوتي بالصوت المختار.
-- أوامر أدمن: إحصائيات حيّة + إذاعة جماعية بطيئة وآمنة + فحص واجهة نموذج خارجي (/inspect).
-- حماية: حد تزامن لعمليات التحويل + تهدئة لكل مستخدم + حد لطول النص.
+- إزالة خلفية الصور بدقة عالية (يعمل محلياً على السيرفر، بدون أي خدمة خارجية).
+- أوامر أدمن: إحصائيات حيّة + إذاعة جماعية بطيئة وآمنة.
+- حماية: حد تزامن لعمليات التحويل/المعالجة + تهدئة لكل مستخدم + حد لطول النص.
 """
 
 import os
 import io
-import json
 import time
 import asyncio
 import logging
@@ -63,6 +62,11 @@ class config:
     BROADCAST_DELAY_SECONDS = 0.05
     VOICES_PER_PAGE = 10
     ACTIVE_NOW_WINDOW_MINUTES = 5
+
+    # إزالة خلفية الصور
+    MAX_CONCURRENT_BG_REMOVAL = 2
+    BG_REMOVAL_COOLDOWN_SECONDS = 5
+    BG_REMOVAL_MODEL = "isnet-general-use"
 
 
 # ====================================================================
@@ -147,7 +151,8 @@ class db:
                     joined_at REAL,
                     last_active REAL,
                     selected_voice TEXT,
-                    is_subscribed INTEGER DEFAULT 0
+                    is_subscribed INTEGER DEFAULT 0,
+                    awaiting_bg_removal INTEGER DEFAULT 0
                 )
             """)
             conn.execute("""
@@ -165,6 +170,10 @@ class db:
                     success INTEGER
                 )
             """)
+            # ترقية آمنة لقاعدة بيانات قديمة (لو كانت موجودة قبل هالعمود)
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+            if "awaiting_bg_removal" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN awaiting_bg_removal INTEGER DEFAULT 0")
 
     # ---------------- المستخدمون ----------------
 
@@ -211,6 +220,23 @@ class db:
                 "UPDATE users SET is_subscribed=? WHERE user_id=?",
                 (1 if subscribed else 0, user_id),
             )
+
+    @staticmethod
+    def set_bg_removal_mode(user_id: int, enabled: bool):
+        with _get_conn() as conn:
+            conn.execute(
+                "UPDATE users SET awaiting_bg_removal=? WHERE user_id=?",
+                (1 if enabled else 0, user_id),
+            )
+
+    @staticmethod
+    def is_awaiting_bg_removal(user_id: int) -> bool:
+        with _get_conn() as conn:
+            cur = conn.execute(
+                "SELECT awaiting_bg_removal FROM users WHERE user_id=?", (user_id,)
+            )
+            row = cur.fetchone()
+            return bool(row and row[0])
 
     @staticmethod
     def get_all_user_ids():
@@ -321,8 +347,11 @@ class db:
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("قائمة الأصوات 🔊", callback_data="menu_voices", style="primary")],
-        [InlineKeyboardButton("الأصوات المُفضلة 💙", callback_data="menu_fav", style="primary")],
+        [
+            InlineKeyboardButton("قائمة الأصوات 🔊", callback_data="menu_voices", style="primary"),
+            InlineKeyboardButton("الأصوات المُفضلة 💙", callback_data="menu_fav", style="primary"),
+        ],
+        [InlineKeyboardButton("إزالة خلفية الصور 🖼️", callback_data="menu_bg_removal", style="success")],
     ])
 
 
@@ -396,12 +425,22 @@ def stats_keyboard():
     ])
 
 
+def back_main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")],
+    ])
+
+
 # ====================================================================
 # 5) منطق البوت
 # ====================================================================
 
 tts_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TTS)
+bg_removal_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_BG_REMOVAL)
 _last_request_time = {}
+_last_bg_removal_time = {}
+
+_bg_removal_session = None  # يُحمَّل عند أول استخدام فقط (كسول)
 
 
 async def is_subscribed(bot, user_id: int) -> bool:
@@ -523,35 +562,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text(name), reply_markup=main_menu_keyboard())
 
 
-# ------------------------------------------------------------------
-# أمر تشخيصي للأدمن فقط: يفحص واجهة API لأي مساحة Gradio ويرجع أسماء
-# الحقول المطلوبة كرسالة نصية. استخدمه هيك: /inspect
-# ------------------------------------------------------------------
-
-async def inspect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != config.ADMIN_ID:
-        return
-
-    await update.message.reply_text("🔍 جارٍ فحص واجهة النموذج، ثواني...")
-
-    try:
-        from gradio_client import Client
-
-        def _inspect():
-            client = Client("ACE-Step/Ace-Step-v1.5")
-            return client.view_api(all_endpoints=True, print_info=False, return_format="dict")
-
-        endpoints = await asyncio.to_thread(_inspect)
-        result_text = json.dumps(endpoints, indent=2, ensure_ascii=False)
-    except Exception as e:
-        result_text = f"فشل الفحص: {e}"
-
-    for i in range(0, len(result_text), 3500):
-        chunk = result_text[i:i + 3500]
-        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
-
-
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
@@ -593,7 +603,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if data == "back_main":
+        db.set_bg_removal_mode(user.id, False)
         await query.edit_message_text(welcome_text(name), reply_markup=main_menu_keyboard())
+        return
+
+    if data == "menu_bg_removal":
+        db.set_bg_removal_mode(user.id, True)
+        await query.edit_message_text(
+            "✅ تم التفعيل، أرسل الصورة لإزالة الخلفية 🖼️",
+            reply_markup=back_main_keyboard(),
+        )
         return
 
     if data == "menu_voices":
@@ -607,10 +626,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_fav":
         fav_ids = db.get_favorites(user.id)
         if not fav_ids:
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")]]
-            )
-            await query.edit_message_text("لا توجد أصوات مفضّلة بعد 💙", reply_markup=kb)
+            await query.edit_message_text("لا توجد أصوات مفضّلة بعد 💙", reply_markup=back_main_keyboard())
             return
         await query.edit_message_text(
             "💙 قائمة أصواتك المفضّلة:", reply_markup=favorites_list_keyboard(0, fav_ids)
@@ -666,10 +682,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if page > 0 and page * config.VOICES_PER_PAGE >= len(fav_ids):
                 page -= 1
             if not fav_ids:
-                kb = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("رجوع للقائمة الرئيسية 🖲", callback_data="back_main")]]
-                )
-                await query.edit_message_text("لا توجد أصوات مفضّلة بعد 💙", reply_markup=kb)
+                await query.edit_message_text("لا توجد أصوات مفضّلة بعد 💙", reply_markup=back_main_keyboard())
                 return
             await query.edit_message_reply_markup(reply_markup=favorites_list_keyboard(page, fav_ids))
         else:
@@ -763,6 +776,72 @@ async def generate_speech(text: str, voice_id: str) -> bytes:
     return bytes(chunks)
 
 
+# ------------------------------------------------------------------
+# إزالة خلفية الصور (rembg — يعمل محلياً على السيرفر، بدون أي خدمة خارجية)
+# ------------------------------------------------------------------
+
+def _get_bg_removal_session():
+    """تحميل نموذج الذكاء الاصطناعي مرة واحدة فقط (كسول) والاحتفاظ فيه بالذاكرة."""
+    global _bg_removal_session
+    if _bg_removal_session is None:
+        from rembg import new_session
+        _bg_removal_session = new_session(config.BG_REMOVAL_MODEL)
+    return _bg_removal_session
+
+
+def _remove_background(image_bytes: bytes) -> bytes:
+    from rembg import remove
+    session = _get_bg_removal_session()
+    return remove(image_bytes, session=session)
+
+
+async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db.upsert_user(user.id, user.username or "", user.language_code or "")
+    db.touch_user(user.id)
+
+    name = user.first_name or "صديقنا"
+    if not await is_subscribed(context.bot, user.id):
+        await update.message.reply_text(force_sub_text(name), reply_markup=subscribe_keyboard())
+        return
+
+    if not db.is_awaiting_bg_removal(user.id):
+        return  # الصورة مو بسياق ميزة إزالة الخلفية، نتجاهلها بهدوء
+
+    now = time.time()
+    last = _last_bg_removal_time.get(user.id, 0)
+    if now - last < config.BG_REMOVAL_COOLDOWN_SECONDS:
+        await update.message.reply_text("⏳ الرجاء الانتظار قليلاً قبل إرسال صورة جديدة.")
+        return
+    _last_bg_removal_time[user.id] = now
+
+    await context.bot.send_chat_action(chat_id=user.id, action=ChatAction.UPLOAD_PHOTO)
+    await update.message.reply_text("🖼️ جارٍ إزالة الخلفية، ثواني...")
+
+    success = False
+    try:
+        photo = update.message.photo[-1]  # أعلى دقة متاحة
+        tg_file = await context.bot.get_file(photo.file_id)
+        input_bytes = bytes(await tg_file.download_as_bytearray())
+
+        async with bg_removal_semaphore:
+            output_bytes = await asyncio.to_thread(_remove_background, input_bytes)
+
+        output_file = io.BytesIO(output_bytes)
+        output_file.name = "no_background.png"
+        await context.bot.send_document(
+            chat_id=user.id,
+            document=output_file,
+            caption="✅ تمت إزالة الخلفية بنجاح",
+        )
+        success = True
+    except Exception as e:
+        logger.exception("فشل إزالة الخلفية: %s", e)
+        await update.message.reply_text("❌ حدث خطأ أثناء إزالة الخلفية، حاول مرة أخرى.")
+    finally:
+        db.log_request(user.id, success)
+
+
 async def do_broadcast(bot, admin_id: int, source_message):
     user_ids = db.get_all_user_ids()
     await bot.send_message(admin_id, f"📡 جارٍ إرسال الإذاعة إلى {len(user_ids)} مستخدم بهدوء...")
@@ -795,7 +874,6 @@ async def do_broadcast(bot, admin_id: int, source_message):
 async def post_init(application: Application):
     await application.bot.set_my_commands([
         BotCommand("start", "بدء استخدام البوت"),
-        BotCommand("inspect", "فحص واجهة نموذج خارجي (أدمن فقط)"),
     ])
 
 
@@ -812,8 +890,8 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("inspect", inspect_command))
     application.add_handler(CallbackQueryHandler(callback_router))
+    application.add_handler(MessageHandler(filters.PHOTO, photo_router))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
     logger.info("VONE bot is starting...")
@@ -822,4 +900,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
