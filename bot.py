@@ -67,6 +67,7 @@ class config:
     MAX_CONCURRENT_BG_REMOVAL = 2
     BG_REMOVAL_COOLDOWN_SECONDS = 5
     BG_REMOVAL_MODEL = "isnet-general-use"
+    BG_REMOVAL_MAX_DIMENSION = 1280  # نصغّر الصور الكبيرة لهالحد قبل المعالجة لتسريعها على معالج ضعيف
 
 
 # ====================================================================
@@ -791,7 +792,22 @@ def _get_bg_removal_session():
 
 def _remove_background(image_bytes: bytes) -> bytes:
     from rembg import remove
+    from PIL import Image
+
     session = _get_bg_removal_session()
+
+    # نصغّر الصورة قبل المعالجة لو كانت كبيرة — يسرّع المعالجة بشكل كبير
+    # على معالج ضعيف بدون أي تأثير ملحوظ على الجودة للاستخدام العادي
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    max_dim = config.BG_REMOVAL_MAX_DIMENSION
+    if max(img.size) > max_dim:
+        ratio = max_dim / max(img.size)
+        new_size = (max(1, int(img.size[0] * ratio)), max(1, int(img.size[1] * ratio)))
+        img = img.resize(new_size, Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        image_bytes = buf.getvalue()
+
     return remove(image_bytes, session=session)
 
 
@@ -900,5 +916,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
