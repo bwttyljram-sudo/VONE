@@ -66,8 +66,12 @@ class config:
     # إزالة خلفية الصور
     MAX_CONCURRENT_BG_REMOVAL = 2
     BG_REMOVAL_COOLDOWN_SECONDS = 5
-    BG_REMOVAL_MODEL = "isnet-general-use"
+    # ملاحظة: تم التحويل من "isnet-general-use" إلى "u2netp" — نموذج أخف بكثير
+    # بالذاكرة، مناسب لخطة Render المجانية (512MB RAM). isnet كان يسبب نفاد
+    # الذاكرة (Out of Memory) فيقتل Render العملية كاملة والبوت يتوقف بالكامل.
+    BG_REMOVAL_MODEL = "u2netp"
     BG_REMOVAL_MAX_DIMENSION = 1280  # نصغّر الصور الكبيرة لهالحد قبل المعالجة لتسريعها على معالج ضعيف
+    BG_REMOVAL_TIMEOUT_SECONDS = 60  # مهلة قصوى للمعالجة، لو تجاوزتها نوقف وننبّه المستخدم بدل التعليق للأبد
 
 
 # ====================================================================
@@ -841,7 +845,12 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         input_bytes = bytes(await tg_file.download_as_bytearray())
 
         async with bg_removal_semaphore:
-            output_bytes = await asyncio.to_thread(_remove_background, input_bytes)
+            # أضفنا مهلة زمنية قصوى — لو المعالجة علقت أو استهلكت وقت طويل،
+            # نوقفها وننبّه المستخدم بدل ما يظل عالق للأبد بلا رد.
+            output_bytes = await asyncio.wait_for(
+                asyncio.to_thread(_remove_background, input_bytes),
+                timeout=config.BG_REMOVAL_TIMEOUT_SECONDS,
+            )
 
         output_file = io.BytesIO(output_bytes)
         output_file.name = "no_background.png"
@@ -851,6 +860,9 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption="✅ تمت إزالة الخلفية بنجاح",
         )
         success = True
+    except asyncio.TimeoutError:
+        logger.warning("انتهت مهلة إزالة الخلفية للمستخدم %s", user.id)
+        await update.message.reply_text("⏱️ استغرقت المعالجة وقت طويل، جرب بصورة أصغر حجماً.")
     except Exception as e:
         logger.exception("فشل إزالة الخلفية: %s", e)
         await update.message.reply_text("❌ حدث خطأ أثناء إزالة الخلفية، حاول مرة أخرى.")
@@ -916,7 +928,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
