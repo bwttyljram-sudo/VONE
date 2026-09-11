@@ -2,19 +2,20 @@
 VONE — بوت تيليجرام لتحويل النص إلى صوت باستخدام أصوات عربية مجانية من Microsoft Edge TTS.
 
 هذا الملف يجمع كل شي بمكان واحد (الإعدادات + قاعدة البيانات + الأصوات + الأزرار + منطق البوت)
-عشان يكون التعامل مع المشروع أبسط — بدون أي تغيير بالمنطق أو السلوك عن النسخة المقسّمة.
+عشان يكون التعامل مع المشروع أبسط.
 
 المميزات:
 - اشتراك إجباري بالقناة قبل الاستخدام.
 - قائمة أصوات مقسّمة على صفحات (10 لكل صفحة) مع أزرار "التالي/السابق".
 - قائمة أصوات مفضّلة لكل مستخدم.
 - تحويل النص المُرسل إلى ملف صوتي بالصوت المختار.
-- أوامر أدمن: إحصائيات حيّة + إذاعة جماعية بطيئة وآمنة.
+- أوامر أدمن: إحصائيات حيّة + إذاعة جماعية بطيئة وآمنة + فحص واجهة نموذج خارجي (/inspect).
 - حماية: حد تزامن لعمليات التحويل + تهدئة لكل مستخدم + حد لطول النص.
 """
 
 import os
 import io
+import json
 import time
 import asyncio
 import logging
@@ -317,15 +318,6 @@ class db:
 # ====================================================================
 # 4) الأزرار (Inline Keyboards)
 # ====================================================================
-#
-# تنسيق بيانات الأزرار (callback_data) موحّد وقصير حتى لا يتجاوز حد تيليجرام (64 بايت):
-#   vlist:{page}                      -> تصفح قائمة كل الأصوات
-#   vfav:{page}                       -> تصفح قائمة الأصوات المفضلة
-#   vsel:{origin}:{page}:{voice_id}   -> اختيار صوت معيّن كصوت نشط
-#   vtog:{origin}:{page}:{voice_id}   -> إضافة/حذف من المفضلة
-#   menu_voices / menu_fav / back_main
-#   check_sub
-#   admin_stats_refresh
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -348,7 +340,6 @@ def _paginate(items, page):
 
 
 def voices_list_keyboard(page: int, favorites: set):
-    """قائمة كل الأصوات مع زر تفعيل + زر تبديل المفضلة لكل صوت."""
     page_items, total = _paginate(VOICES, page)
     rows = []
     for v in page_items:
@@ -412,10 +403,6 @@ def stats_keyboard():
 tts_semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_TTS)
 _last_request_time = {}
 
-
-# ------------------------------------------------------------------
-# أدوات مساعدة
-# ------------------------------------------------------------------
 
 async def is_subscribed(bot, user_id: int) -> bool:
     try:
@@ -522,10 +509,6 @@ async def send_stats(bot, chat_id: int, message_id: int = None):
     )
 
 
-# ------------------------------------------------------------------
-# /start
-# ------------------------------------------------------------------
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.upsert_user(user.id, user.username or "", user.language_code or "")
@@ -541,8 +524,33 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------------
-# استقبال ضغطات الأزرار
+# أمر تشخيصي للأدمن فقط: يفحص واجهة API لأي مساحة Gradio ويرجع أسماء
+# الحقول المطلوبة كرسالة نصية. استخدمه هيك: /inspect
 # ------------------------------------------------------------------
+
+async def inspect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != config.ADMIN_ID:
+        return
+
+    await update.message.reply_text("🔍 جارٍ فحص واجهة النموذج، ثواني...")
+
+    try:
+        from gradio_client import Client
+
+        def _inspect():
+            client = Client("ACE-Step/Ace-Step-v1.5")
+            return client.view_api(all_endpoints=True, print_info=False, return_format="dict")
+
+        endpoints = await asyncio.to_thread(_inspect)
+        result_text = json.dumps(endpoints, indent=2, ensure_ascii=False)
+    except Exception as e:
+        result_text = f"فشل الفحص: {e}"
+
+    for i in range(0, len(result_text), 3500):
+        chunk = result_text[i:i + 3500]
+        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+
 
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -670,10 +678,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-# ------------------------------------------------------------------
-# استقبال الرسائل النصية (نص التحويل + أوامر الأدمن النصية)
-# ------------------------------------------------------------------
-
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (update.message.text or "").strip()
@@ -689,8 +693,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in ("إحصائيات", "احصائيات"):
             await send_stats(context.bot, user.id)
             return
-            return
-    
+
         if text in ("إذاعة", "اذاعة"):
             context.user_data["awaiting_broadcast"] = True
             await update.message.reply_text(
@@ -760,10 +763,6 @@ async def generate_speech(text: str, voice_id: str) -> bytes:
     return bytes(chunks)
 
 
-# ------------------------------------------------------------------
-# الإذاعة الجماعية
-# ------------------------------------------------------------------
-
 async def do_broadcast(bot, admin_id: int, source_message):
     user_ids = db.get_all_user_ids()
     await bot.send_message(admin_id, f"📡 جارٍ إرسال الإذاعة إلى {len(user_ids)} مستخدم بهدوء...")
@@ -793,30 +792,11 @@ async def do_broadcast(bot, admin_id: int, source_message):
     )
 
 
-# ------------------------------------------------------------------
-# الإعداد والتشغيل
-# ------------------------------------------------------------------
-async def inspect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != config.ADMIN_ID:
-        return
-    await update.message.reply_text("🔍 جارٍ فحص واجهة النموذج، ثواني...")
-    try:
-        import json
-        from gradio_client import Client
-
-        def _inspect():
-            client = Client("ACE-Step/Ace-Step-v1.5")
-            return client.view_api(all_endpoints=True, print_info=False, return_format="dict")
-
-        endpoints = await asyncio.to_thread(_inspect)
-        result_text = json.dumps(endpoints, indent=2, ensure_ascii=False)
-    except Exception as e:
-        result_text = f"فشل الفحص: {e}"
-
-    for i in range(0, len(result_text), 3500):
-        await update.message.reply_text(f"```\n{result_text[i:i+3500]}\n```", parse_mode="Markdown")
 async def post_init(application: Application):
-    await application.bot.set_my_commands([BotCommand("start", "بدء استخدام البوت")])
+    await application.bot.set_my_commands([
+        BotCommand("start", "بدء استخدام البوت"),
+        BotCommand("inspect", "فحص واجهة نموذج خارجي (أدمن فقط)"),
+    ])
 
 
 def main():
@@ -842,3 +822,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
