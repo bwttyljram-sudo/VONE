@@ -1,5 +1,8 @@
 """
 VONE — بوت تيليجرام لتحويل النص إلى صوت باستخدام أصوات عربية مجانية من Microsoft Edge TTS.
+
+قاعدة البيانات: Turso (libSQL) عند توفر متغيرات البيئة TURSO_DATABASE_URL و TURSO_AUTH_TOKEN،
+وإلا يرجع تلقائياً لملف SQLite محلي كما كان — حتى لا ينكسر أي شيء لو نسيت إضافتهم.
 """
 
 import os
@@ -40,6 +43,10 @@ class config:
     CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/ZenoX_Tools").strip()
     PORT = int(os.environ.get("PORT", "10000"))
     DB_PATH = os.environ.get("DB_PATH", "bot_database.db")
+
+    # قاعدة بيانات Turso (اختيارية) — لو فاضية يرجع البوت لملف SQLite محلي تلقائياً
+    TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
 
     MAX_CONCURRENT_TTS = 5
     PER_USER_COOLDOWN_SECONDS = 3
@@ -91,10 +98,38 @@ def get_voice(voice_id: str):
     return VOICES_BY_ID.get(voice_id)
 
 
+# ====================================================================
+# قاعدة البيانات
+# ====================================================================
+#
+# اتصال واحد دائم يُفتح مرة واحدة ويُعاد استخدامه (بدل فتح/قفل اتصال جديد
+# بكل استعلام) — هذا ضروري مع Turso لأنه يتجنب تكلفة إعادة الاتصال عبر
+# الشبكة في كل عملية، ويرجّع نفس الفائدة مع SQLite المحلي أيضاً.
+
 _db_lock = threading.Lock()
+_conn = None
 
 
 def _db_connect():
+    if config.TURSO_URL and config.TURSO_AUTH_TOKEN:
+        try:
+            import libsql
+            conn = libsql.connect(
+                config.DB_PATH,
+                sync_url=config.TURSO_URL,
+                auth_token=config.TURSO_AUTH_TOKEN,
+                sync_interval=60,
+            )
+            # نسحب كل البيانات المحفوظة سابقاً من Turso فور الاتصال —
+            # هذا بالضبط ما يحل مشكلة فقدان المستخدمين عند إعادة تشغيل البوت.
+            conn.sync()
+            logger.info("تم الاتصال بقاعدة بيانات Turso ومزامنتها بنجاح — المستخدمون محفوظون بشكل دائم ✅")
+            return conn
+        except Exception as e:
+            logger.error(
+                "فشل الاتصال بـ Turso، سيعمل البوت بملف محلي مؤقت بدون حفظ دائم: %s", e
+            )
+
     conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
@@ -102,13 +137,12 @@ def _db_connect():
 
 @contextmanager
 def _get_conn():
+    global _conn
     with _db_lock:
-        conn = _db_connect()
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        if _conn is None:
+            _conn = _db_connect()
+        yield _conn
+        _conn.commit()
 
 
 class db:
@@ -738,7 +772,11 @@ def main():
     threading.Thread(target=run_server, daemon=True).start()
 
     application = (
-        ApplicationBuilder().token(config.BOT_TOKEN).post_init(post_init).build()
+        ApplicationBuilder()
+        .token(config.BOT_TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(True)
+        .build()
     )
 
     application.add_handler(CommandHandler("start", start_command))
@@ -751,6 +789,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
