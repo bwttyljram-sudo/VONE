@@ -114,16 +114,11 @@ def _db_connect():
     if config.TURSO_URL and config.TURSO_AUTH_TOKEN:
         try:
             import libsql
-            conn = libsql.connect(
-                config.DB_PATH,
-                sync_url=config.TURSO_URL,
-                auth_token=config.TURSO_AUTH_TOKEN,
-                sync_interval=60,
-            )
-            # نسحب كل البيانات المحفوظة سابقاً من Turso فور الاتصال —
-            # هذا بالضبط ما يحل مشكلة فقدان المستخدمين عند إعادة تشغيل البوت.
-            conn.sync()
-            logger.info("تم الاتصال بقاعدة بيانات Turso ومزامنتها بنجاح — المستخدمون محفوظون بشكل دائم ✅")
+            # اتصال مباشر بقاعدة Turso السحابية عبر الشبكة — بدون أي ملف محلي وسيط.
+            # كل عملية قراءة/كتابة تذهب مباشرة لقاعدة البيانات الدائمة، فما فيه
+            # أي احتمال لضياع بيانات بسبب إعادة تشغيل أو حذف القرص المؤقت لـ Render.
+            conn = libsql.connect(database=config.TURSO_URL, auth_token=config.TURSO_AUTH_TOKEN)
+            logger.info("تم الاتصال المباشر بقاعدة بيانات Turso بنجاح — كل عملية تُحفظ فوراً وبشكل دائم ✅")
             return conn
         except Exception as e:
             logger.error(
