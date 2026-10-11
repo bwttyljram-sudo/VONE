@@ -462,8 +462,8 @@ def main_menu_keyboard(lang: str):
         [InlineKeyboardButton(t("btn_voices", lang), callback_data="menu_voices", style="primary")],
         [InlineKeyboardButton(t("btn_favorites", lang), callback_data="menu_fav", style="primary")],
         [
-            InlineKeyboardButton("English 🇺🇸", callback_data="set_lang:en", style="primary"),
-            InlineKeyboardButton("🇾🇪 عربي", callback_data="set_lang:ar", style="primary"),
+            InlineKeyboardButton("English 🇺🇸", callback_data="set_lang:en", style="success"),
+            InlineKeyboardButton("🇾🇪 عربي", callback_data="set_lang:ar", style="success"),
         ],
     ])
 
