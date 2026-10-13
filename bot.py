@@ -4,6 +4,10 @@ VONE — بوت تيليجرام لتحويل النص إلى صوت باستخ�
 واجهة المستخدم ثنائية اللغة (عربي/إنجليزي) — لوحة الأدمن (إحصائيات/إذاعة) تبقى عربي فقط.
 قاعدة البيانات: Turso (libSQL) عند توفر متغيرات البيئة TURSO_DATABASE_URL و TURSO_AUTH_TOKEN،
 وإلا يرجع تلقائياً لملف SQLite محلي كما كان.
+
+تحسينات أداء: تخزين مؤقت بالذاكرة لإعدادات المستخدم (لغة/صوت/سرعة) وتقليل عدد
+عمليات الكتابة المتكررة لقاعدة البيانات — يقلل التأخير الناتج عن الاتصال بقاعدة
+بيانات عن بعد (Turso) مع كل رسالة.
 """
 
 import os
@@ -55,9 +59,15 @@ class config:
     VOICES_PER_PAGE = 10
     ACTIVE_NOW_WINDOW_MINUTES = 5
 
+    # كم ثانية بين كل تحديث لـ"آخر نشاط" لنفس المستخدم (يقلل الكتابة المتكررة)
+    TOUCH_THROTTLE_SECONDS = 30
+
+
+SPEED_RATE = {"slow": "-20%", "normal": "+0%", "fast": "+20%"}
+
 
 # ====================================================================
-# الترجمة — كل النصوص اللي يشوفها المستخدم (عدا لوحة الأدمن) بمكان واحد
+# الترجمة
 # ====================================================================
 
 STRINGS = {
@@ -78,6 +88,7 @@ STRINGS = {
         ),
         "btn_voices": "قائمة الأصوات 🔊",
         "btn_favorites": "الأصوات المُفضلة 💙",
+        "btn_my_stats": "📊 إحصائياتي",
         "btn_subscribe": "أشترك في القناة 📺",
         "btn_check": "تحقق 🔍",
         "btn_back": "رجوع للقائمة الرئيسية 🖲",
@@ -103,6 +114,15 @@ STRINGS = {
         "text_too_long": "⚠️ النص طويل جداً، الحد الأقصى المسموح به {max} حرف.",
         "tts_error": "❌ حدث خطأ أثناء تحويل النص إلى صوت، حاول مرة أخرى.",
         "lang_changed": "✅ تم تغيير اللغة إلى العربي",
+        "speed_slow": "🐢 بطيء",
+        "speed_normal": "⚖️ عادي",
+        "speed_fast": "🐇 سريع",
+        "speed_changed": "تم ضبط السرعة: {speed}",
+        "stats_title": "📊 إحصائياتك الشخصية",
+        "stats_joined": "📅 عضو منذ: {date}",
+        "stats_voice": "🔊 الصوت الحالي: {voice}",
+        "stats_no_voice": "لم تختر صوتاً بعد",
+        "stats_success": "✅ عدد التحويلات الناجحة: {count}",
     },
     "en": {
         "welcome": (
@@ -121,6 +141,7 @@ STRINGS = {
         ),
         "btn_voices": "Voice List 🔊",
         "btn_favorites": "Favorite Voices 💙",
+        "btn_my_stats": "📊 My Stats",
         "btn_subscribe": "Join Channel 📺",
         "btn_check": "Verify 🔍",
         "btn_back": "Back to Main Menu 🖲",
@@ -146,6 +167,15 @@ STRINGS = {
         "text_too_long": "⚠️ Text is too long, the maximum allowed is {max} characters.",
         "tts_error": "❌ An error occurred while converting text to speech, please try again.",
         "lang_changed": "✅ Language changed to English",
+        "speed_slow": "🐢 Slow",
+        "speed_normal": "⚖️ Normal",
+        "speed_fast": "🐇 Fast",
+        "speed_changed": "Speed set to: {speed}",
+        "stats_title": "📊 Your Personal Stats",
+        "stats_joined": "📅 Member since: {date}",
+        "stats_voice": "🔊 Current voice: {voice}",
+        "stats_no_voice": "No voice selected yet",
+        "stats_success": "✅ Successful conversions: {count}",
     },
 }
 
@@ -157,7 +187,7 @@ def t(key: str, lang: str, **kwargs) -> str:
 
 
 # ====================================================================
-# الأصوات — مجموعتين منفصلتين (عربي / إنجليزي) من Microsoft Edge TTS
+# الأصوات
 # ====================================================================
 
 VOICES_AR = [
@@ -273,7 +303,8 @@ class db:
                     last_active REAL,
                     selected_voice TEXT,
                     is_subscribed INTEGER DEFAULT 0,
-                    lang TEXT DEFAULT 'ar'
+                    lang TEXT DEFAULT 'ar',
+                    speed TEXT DEFAULT 'normal'
                 )
             """)
             conn.execute("""
@@ -291,12 +322,13 @@ class db:
                     success INTEGER
                 )
             """)
-            # ترقية آمنة لقاعدة بيانات موجودة سابقاً (مثل قاعدة Turso الحالية
-            # اللي فيها مستخدمين حقيقيين) — نضيف عمود lang لو ناقص بدون أي
-            # خطر على البيانات الموجودة.
+            # ترقية آمنة لقاعدة بيانات موجودة سابقاً (فيها مستخدمين حقيقيين على
+            # Turso) — نضيف أي عمود ناقص بدون أي خطر على البيانات الموجودة.
             cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
             if "lang" not in cols:
                 conn.execute("ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'ar'")
+            if "speed" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN speed TEXT DEFAULT 'normal'")
 
     @staticmethod
     def upsert_user(user_id: int, username: str, language_code: str):
@@ -311,8 +343,8 @@ class db:
                 )
             else:
                 conn.execute(
-                    "INSERT INTO users (user_id, username, language_code, joined_at, last_active, selected_voice, lang) "
-                    "VALUES (?, ?, ?, ?, ?, NULL, 'ar')",
+                    "INSERT INTO users (user_id, username, language_code, joined_at, last_active, selected_voice, lang, speed) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, 'ar', 'normal')",
                     (user_id, username, language_code, now, now),
                 )
         return not exists
@@ -353,6 +385,18 @@ class db:
             cur = conn.execute("SELECT lang FROM users WHERE user_id=?", (user_id,))
             row = cur.fetchone()
             return row[0] if row and row[0] else "ar"
+
+    @staticmethod
+    def set_speed(user_id: int, speed: str):
+        with _get_conn() as conn:
+            conn.execute("UPDATE users SET speed=? WHERE user_id=?", (speed, user_id))
+
+    @staticmethod
+    def get_speed(user_id: int) -> str:
+        with _get_conn() as conn:
+            cur = conn.execute("SELECT speed FROM users WHERE user_id=?", (user_id,))
+            row = cur.fetchone()
+            return row[0] if row and row[0] else "normal"
 
     @staticmethod
     def get_all_user_ids():
@@ -406,6 +450,16 @@ class db:
             )
 
     @staticmethod
+    def get_user_personal_stats(user_id: int):
+        with _get_conn() as conn:
+            row = conn.execute("SELECT joined_at FROM users WHERE user_id=?", (user_id,)).fetchone()
+            joined_at = row[0] if row else None
+            success_count = conn.execute(
+                "SELECT COUNT(*) FROM requests WHERE user_id=? AND success=1", (user_id,)
+            ).fetchone()[0]
+        return {"joined_at": joined_at, "success_count": success_count}
+
+    @staticmethod
     def get_stats():
         now = time.time()
         day = 86400
@@ -454,13 +508,84 @@ class db:
 
 
 # ====================================================================
-# الأزرار (Inline Keyboards) — كلها تأخذ lang وترجع النصوص الصحيحة
+# طبقة تخزين مؤقت بالذاكرة — تقلل الضغط على قاعدة البيانات البعيدة
+# ====================================================================
+#
+# لغة/صوت/سرعة كل مستخدم تتغيّر نادراً، فنحتفظ بنسخة بالذاكرة ونقرأ منها
+# مباشرة بدل سؤال قاعدة البيانات كل مرة. أي تعديل يُكتب لقاعدة البيانات
+# وللذاكرة معاً، فلا يضيع شيء حتى لو البوت أعاد التشغيل (يُعاد تحميله
+# بكسل من قاعدة البيانات عند أول استخدام بعد إعادة التشغيل).
+
+_cache_lock = threading.Lock()
+_user_settings_cache = {}   # user_id -> {"lang":.., "voice":.., "speed":..}
+_known_users = set()        # مستخدمون تم تسجيلهم بقاعدة البيانات بهذا التشغيل
+_last_touch_time = {}       # user_id -> آخر وقت حُدّث فيه "آخر نشاط"
+
+
+def ensure_user(user_id: int, username: str, language_code: str):
+    """يسجّل المستخدم بقاعدة البيانات أول مرة بس، وبعدها يحدّث "آخر نشاط"
+    بحد أقصى مرة كل TOUCH_THROTTLE_SECONDS بدل كل رسالة."""
+    if user_id not in _known_users:
+        db.upsert_user(user_id, username, language_code)
+        _known_users.add(user_id)
+        _last_touch_time[user_id] = time.time()
+        return
+
+    now = time.time()
+    if now - _last_touch_time.get(user_id, 0) >= config.TOUCH_THROTTLE_SECONDS:
+        db.touch_user(user_id)
+        _last_touch_time[user_id] = now
+
+
+def _get_cached(user_id: int, key: str, loader):
+    with _cache_lock:
+        entry = _user_settings_cache.setdefault(user_id, {})
+        if key not in entry:
+            entry[key] = loader()
+        return entry[key]
+
+
+def _set_cached(user_id: int, key: str, value):
+    with _cache_lock:
+        _user_settings_cache.setdefault(user_id, {})[key] = value
+
+
+def get_user_lang(user_id: int) -> str:
+    return _get_cached(user_id, "lang", lambda: db.get_lang(user_id))
+
+
+def set_user_lang(user_id: int, lang: str):
+    db.set_lang(user_id, lang)
+    _set_cached(user_id, "lang", lang)
+
+
+def get_user_voice_id(user_id: int):
+    return _get_cached(user_id, "voice", lambda: db.get_selected_voice(user_id))
+
+
+def set_user_voice_id(user_id: int, voice_id: str):
+    db.set_selected_voice(user_id, voice_id)
+    _set_cached(user_id, "voice", voice_id)
+
+
+def get_user_speed(user_id: int) -> str:
+    return _get_cached(user_id, "speed", lambda: db.get_speed(user_id))
+
+
+def set_user_speed(user_id: int, speed: str):
+    db.set_speed(user_id, speed)
+    _set_cached(user_id, "speed", speed)
+
+
+# ====================================================================
+# الأزرار (Inline Keyboards)
 # ====================================================================
 
 def main_menu_keyboard(lang: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(t("btn_voices", lang), callback_data="menu_voices", style="primary")],
         [InlineKeyboardButton(t("btn_favorites", lang), callback_data="menu_fav", style="primary")],
+        [InlineKeyboardButton(t("btn_my_stats", lang), callback_data="menu_my_stats", style="success")],
         [
             InlineKeyboardButton("English 🇺🇸", callback_data="set_lang:en", style="success"),
             InlineKeyboardButton("🇾🇪 عربي", callback_data="set_lang:ar", style="success"),
@@ -472,6 +597,12 @@ def subscribe_keyboard(lang: str):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(t("btn_subscribe", lang), url=config.CHANNEL_LINK, style="danger")],
         [InlineKeyboardButton(t("btn_check", lang), callback_data="check_sub", style="primary")],
+    ])
+
+
+def back_main_keyboard(lang: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t("btn_back", lang), callback_data="back_main")],
     ])
 
 
@@ -534,6 +665,21 @@ def favorites_list_keyboard(page: int, favorite_voice_ids: list, lang: str):
     return InlineKeyboardMarkup(rows)
 
 
+def with_speed_row(keyboard: InlineKeyboardMarkup, lang: str, current_speed: str, origin: str, page: int):
+    """يضيف صف تحكم بالسرعة تحت قائمة الأصوات (يظهر بعد اختيار صوت فقط)."""
+    rows = [list(row) for row in keyboard.inline_keyboard]
+    speed_row = []
+    for value in ("slow", "normal", "fast"):
+        label = t(f"speed_{value}", lang)
+        if value == current_speed:
+            label = "✅ " + label
+        speed_row.append(
+            InlineKeyboardButton(label, callback_data=f"speed:{value}:{origin}:{page}", style="success")
+        )
+    rows.insert(len(rows) - 1, speed_row)  # قبل صف "رجوع للقائمة الرئيسية" اللي دايماً أخير صف
+    return InlineKeyboardMarkup(rows)
+
+
 def stats_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("تحديث 🔄", callback_data="admin_stats_refresh", style="primary")],
@@ -568,6 +714,26 @@ async def is_subscribed(bot, user_id: int) -> bool:
 
 
 SEP = "➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖"
+
+
+def build_personal_stats_text(lang: str, user_id: int) -> str:
+    stats = db.get_user_personal_stats(user_id)
+    joined_at = stats["joined_at"]
+    date_str = time.strftime("%Y-%m-%d", time.gmtime(joined_at)) if joined_at else "—"
+
+    voice_id = get_user_voice_id(user_id)
+    voice = get_voice(voice_id) if voice_id else None
+    voice_str = f"{voice['emoji']} {voice['name']}" if voice else t("stats_no_voice", lang)
+
+    lines = [
+        t("stats_title", lang),
+        SEP,
+        "",
+        t("stats_joined", lang, date=date_str),
+        t("stats_voice", lang, voice=voice_str),
+        t("stats_success", lang, count=stats["success_count"]),
+    ]
+    return "\n".join(lines)
 
 
 def build_stats_text(stats: dict) -> str:
@@ -635,10 +801,10 @@ async def send_stats(bot, chat_id: int, message_id: int = None):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db.upsert_user(user.id, user.username or "", user.language_code or "")
+    ensure_user(user.id, user.username or "", user.language_code or "")
 
     name = user.first_name or "صديقنا"
-    lang = db.get_lang(user.id)
+    lang = get_user_lang(user.id)
     subscribed = await is_subscribed(context.bot, user.id)
 
     if not subscribed:
@@ -658,8 +824,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data or ""
     name = user.first_name or "صديقنا"
 
-    db.touch_user(user.id)
-    lang = db.get_lang(user.id)
+    ensure_user(user.id, user.username or "", user.language_code or "")
+    lang = get_user_lang(user.id)
 
     if data == "check_sub":
         subscribed = await is_subscribed(context.bot, user.id)
@@ -701,11 +867,36 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_lang = data.split(":", 1)[1]
         if new_lang not in ("ar", "en"):
             return
-        db.set_lang(user.id, new_lang)
+        set_user_lang(user.id, new_lang)
         await query.answer(t("lang_changed", new_lang))
         await query.edit_message_text(
             t("welcome", new_lang, name=name), reply_markup=main_menu_keyboard(new_lang)
         )
+        return
+
+    # مهم: لازم يكون قبل await query.answer() العام تحت — عشان ما يصير
+    # استدعاء answer() مرتين لنفس الضغطة (تيليجرام يرفض الاستدعاء الثاني).
+    if data.startswith("speed:"):
+        _, value, origin, page = data.split(":", 3)
+        if value not in SPEED_RATE:
+            return
+        set_user_speed(user.id, value)
+        await query.answer(t("speed_changed", lang, speed=t(f"speed_{value}", lang)))
+
+        voice_id = get_user_voice_id(user.id)
+        voice = get_voice(voice_id)
+        if not voice:
+            return
+        header = t("voice_selected_header", lang, emoji=voice["emoji"], name=voice["name"])
+        page = int(page)
+        if origin == "fav":
+            fav_ids = db.get_favorites(user.id)
+            kb = favorites_list_keyboard(page, fav_ids, lang)
+        else:
+            favs = set(db.get_favorites(user.id))
+            kb = voices_list_keyboard(page, favs, lang)
+        kb = with_speed_row(kb, lang, value, origin, page)
+        await query.edit_message_text(header, reply_markup=kb)
         return
 
     await query.answer()
@@ -713,6 +904,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "back_main":
         await query.edit_message_text(
             t("welcome", lang, name=name), reply_markup=main_menu_keyboard(lang)
+        )
+        return
+
+    if data == "menu_my_stats":
+        await query.edit_message_text(
+            build_personal_stats_text(lang, user.id), reply_markup=back_main_keyboard(lang)
         )
         return
 
@@ -726,10 +923,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_fav":
         fav_ids = db.get_favorites(user.id)
         if not fav_ids:
-            kb = InlineKeyboardMarkup(
-                [[InlineKeyboardButton(t("btn_back", lang), callback_data="back_main")]]
-            )
-            await query.edit_message_text(t("favorites_empty", lang), reply_markup=kb)
+            await query.edit_message_text(t("favorites_empty", lang), reply_markup=back_main_keyboard(lang))
             return
         await query.edit_message_text(
             t("favorites_header", lang), reply_markup=favorites_list_keyboard(0, fav_ids, lang)
@@ -758,19 +952,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not voice:
             await query.answer(t("voice_unavailable_alert", lang), show_alert=True)
             return
-        db.set_selected_voice(user.id, voice_id)
+        set_user_voice_id(user.id, voice_id)
         await query.answer(t("voice_selected_alert", lang, name=voice["name"], emoji=voice["emoji"]))
-        favs = set(db.get_favorites(user.id))
         header = t("voice_selected_header", lang, emoji=voice["emoji"], name=voice["name"])
+        speed = get_user_speed(user.id)
         if origin == "fav":
             fav_ids = db.get_favorites(user.id)
-            await query.edit_message_text(
-                header, reply_markup=favorites_list_keyboard(int(page), fav_ids, lang)
-            )
+            kb = favorites_list_keyboard(int(page), fav_ids, lang)
         else:
-            await query.edit_message_text(
-                header, reply_markup=voices_list_keyboard(int(page), favs, lang)
-            )
+            favs = set(db.get_favorites(user.id))
+            kb = voices_list_keyboard(int(page), favs, lang)
+        kb = with_speed_row(kb, lang, speed, origin, int(page))
+        await query.edit_message_text(header, reply_markup=kb)
         return
 
     if data.startswith("vtog:"):
@@ -784,10 +977,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if page > 0 and page * config.VOICES_PER_PAGE >= len(fav_ids):
                 page -= 1
             if not fav_ids:
-                kb = InlineKeyboardMarkup(
-                    [[InlineKeyboardButton(t("btn_back", lang), callback_data="back_main")]]
-                )
-                await query.edit_message_text(t("favorites_empty", lang), reply_markup=kb)
+                await query.edit_message_text(t("favorites_empty", lang), reply_markup=back_main_keyboard(lang))
                 return
             await query.edit_message_reply_markup(reply_markup=favorites_list_keyboard(page, fav_ids, lang))
         else:
@@ -799,8 +989,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (update.message.text or "").strip()
-    db.upsert_user(user.id, user.username or "", user.language_code or "")
-    db.touch_user(user.id)
+    ensure_user(user.id, user.username or "", user.language_code or "")
 
     if user.id == config.ADMIN_ID:
         if context.user_data.get("awaiting_broadcast"):
@@ -820,7 +1009,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     name = user.first_name or "صديقنا"
-    lang = db.get_lang(user.id)
+    lang = get_user_lang(user.id)
 
     if not await is_subscribed(context.bot, user.id):
         await update.message.reply_text(
@@ -828,7 +1017,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    voice_id = db.get_selected_voice(user.id)
+    voice_id = get_user_voice_id(user.id)
     voice = get_voice(voice_id) if voice_id else None
     if not voice:
         await update.message.reply_text(
@@ -851,10 +1040,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(chat_id=user.id, action=ChatAction.RECORD_VOICE)
 
+    speed = get_user_speed(user.id)
+    rate = SPEED_RATE.get(speed, "+0%")
+
     success = False
     try:
         async with tts_semaphore:
-            audio_bytes = await generate_speech(text, voice["id"])
+            audio_bytes = await generate_speech(text, voice["id"], rate)
         if not audio_bytes:
             raise RuntimeError("empty audio")
 
@@ -874,13 +1066,26 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.log_request(user.id, success)
 
 
-async def generate_speech(text: str, voice_id: str) -> bytes:
-    communicate = edge_tts.Communicate(text, voice_id)
-    chunks = bytearray()
-    async for chunk in communicate.stream():
-        if chunk.get("type") == "audio":
-            chunks.extend(chunk["data"])
-    return bytes(chunks)
+async def generate_speech(text: str, voice_id: str, rate: str = "+0%") -> bytes:
+    """يحاول التوليد مرتين قبل الاستسلام — خدمة مايكروسوفت غير الرسمية (edge-tts)
+    أحياناً ترفض طلب لحظياً تحت الضغط، وإعادة المحاولة فوراً تحل أغلب هالحالات."""
+    last_error = None
+    for attempt in range(2):
+        try:
+            communicate = edge_tts.Communicate(text, voice_id, rate=rate)
+            chunks = bytearray()
+            async for chunk in communicate.stream():
+                if chunk.get("type") == "audio":
+                    chunks.extend(chunk["data"])
+            if chunks:
+                return bytes(chunks)
+            raise RuntimeError("empty audio stream")
+        except Exception as e:
+            last_error = e
+            logger.warning("محاولة توليد الصوت رقم %s فشلت: %s", attempt + 1, e)
+            if attempt == 0:
+                await asyncio.sleep(1)
+    raise last_error
 
 
 async def do_broadcast(bot, admin_id: int, source_message):
@@ -942,6 +1147,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
