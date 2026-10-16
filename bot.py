@@ -686,6 +686,12 @@ def stats_keyboard():
     ])
 
 
+def broadcast_cancel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("إلغاء الإذاعة ❌", callback_data="admin_broadcast_cancel", style="danger")],
+    ])
+
+
 # ====================================================================
 # منطق البوت
 # ====================================================================
@@ -863,6 +869,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_stats(context.bot, query.message.chat_id, query.message.message_id)
         return
 
+    if data == "admin_broadcast_cancel":
+        if user.id != config.ADMIN_ID:
+            await query.answer("هذا الأمر للأدمن فقط ❌", show_alert=True)
+            return
+        context.user_data["awaiting_broadcast"] = False
+        await query.answer("تم إلغاء الإذاعة ❌")
+        try:
+            await query.edit_message_text("❌ تم إلغاء وضع الإذاعة.")
+        except BadRequest:
+            pass
+        return
+
     if data.startswith("set_lang:"):
         new_lang = data.split(":", 1)[1]
         if new_lang not in ("ar", "en"):
@@ -1004,7 +1022,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in ("إذاعة", "اذاعة"):
             context.user_data["awaiting_broadcast"] = True
             await update.message.reply_text(
-                "📡 تم تفعيل وضع الإذاعة.\nأرسل الآن المنشور (نص أو صورة أو أي رسالة) الذي تريد إرساله لجميع المستخدمين."
+                "📡 تم تفعيل وضع الإذاعة.\nأرسل الآن المنشور (نص أو صورة أو أي رسالة) الذي تريد إرساله لجميع المستخدمين.",
+                reply_markup=broadcast_cancel_keyboard(),
             )
             return
 
@@ -1066,6 +1085,15 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.log_request(user.id, success)
 
 
+async def broadcast_media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != config.ADMIN_ID:
+        return
+    if context.user_data.get("awaiting_broadcast"):
+        context.user_data["awaiting_broadcast"] = False
+        await do_broadcast(context.bot, user.id, update.message)
+
+
 async def generate_speech(text: str, voice_id: str, rate: str = "+0%") -> bytes:
     """يحاول التوليد مرتين قبل الاستسلام — خدمة مايكروسوفت غير الرسمية (edge-tts)
     أحياناً ترفض طلب لحظياً تحت الضغط، وإعادة المحاولة فوراً تحل أغلب هالحالات."""
@@ -1097,11 +1125,18 @@ async def do_broadcast(bot, admin_id: int, source_message):
         if uid == admin_id:
             continue
         try:
-            await bot.copy_message(
-                chat_id=uid,
-                from_chat_id=source_message.chat_id,
-                message_id=source_message.message_id,
-            )
+            if getattr(source_message, "forward_origin", None) is not None:
+                await bot.forward_message(
+                    chat_id=uid,
+                    from_chat_id=source_message.chat_id,
+                    message_id=source_message.message_id,
+                )
+            else:
+                await bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=source_message.chat_id,
+                    message_id=source_message.message_id,
+                )
             sent += 1
         except Forbidden:
             db.remove_user(uid)
@@ -1140,6 +1175,9 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CallbackQueryHandler(callback_router))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    application.add_handler(
+        MessageHandler(filters.User(config.ADMIN_ID) & ~filters.TEXT & ~filters.COMMAND, broadcast_media_router)
+    )
 
     logger.info("VONE bot is starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
