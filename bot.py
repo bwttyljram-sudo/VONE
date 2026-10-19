@@ -22,7 +22,7 @@ from contextlib import contextmanager
 import edge_tts
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus, ChatAction, ParseMode
-from telegram.error import Forbidden, BadRequest
+from telegram.error import Forbidden, BadRequest, RetryAfter, NetworkError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -56,6 +56,7 @@ class config:
     PER_USER_COOLDOWN_SECONDS = 3
     MAX_TEXT_LENGTH = 2000
     BROADCAST_DELAY_SECONDS = 0.05
+    BROADCAST_BATCH_SIZE = 25  # عدد الرسائل المتزامنة كل ثانية (حد تيليجرام ~30/ثانية)
     VOICES_PER_PAGE = 10
     ACTIVE_NOW_WINDOW_MINUTES = 5
 
@@ -1116,14 +1117,10 @@ async def generate_speech(text: str, voice_id: str, rate: str = "+0%") -> bytes:
     raise last_error
 
 
-async def do_broadcast(bot, admin_id: int, source_message):
-    user_ids = db.get_all_user_ids()
-    await bot.send_message(admin_id, f"📡 جارٍ إرسال الإذاعة إلى {len(user_ids)} مستخدم بهدوء...")
-
-    sent, failed = 0, 0
-    for uid in user_ids:
-        if uid == admin_id:
-            continue
+async def _send_one(bot, uid: int, source_message) -> str:
+    """يرسل الإذاعة لمستخدم واحد مع إعادة المحاولة عند قيود تيليجرام.
+    يرجع: "ok" أو "blocked" أو "failed"."""
+    for attempt in range(5):
         try:
             if getattr(source_message, "forward_origin", None) is not None:
                 await bot.forward_message(
@@ -1137,18 +1134,66 @@ async def do_broadcast(bot, admin_id: int, source_message):
                     from_chat_id=source_message.chat_id,
                     message_id=source_message.message_id,
                 )
-            sent += 1
+            return "ok"
         except Forbidden:
             db.remove_user(uid)
-            failed += 1
+            return "blocked"
+        except RetryAfter as e:
+            wait = e.retry_after
+            wait = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+            await asyncio.sleep(wait + 1)
+        except NetworkError as e:
+            logger.warning("خطأ شبكة أثناء الإذاعة للمستخدم %s (محاولة %s): %s", uid, attempt + 1, e)
+            await asyncio.sleep(1 + attempt)
         except Exception as e:
             logger.warning("فشل إرسال الإذاعة للمستخدم %s: %s", uid, e)
-            failed += 1
+            return "failed"
+    return "failed"
 
-        await asyncio.sleep(config.BROADCAST_DELAY_SECONDS)
+
+async def do_broadcast(bot, admin_id: int, source_message):
+    user_ids = db.get_all_user_ids()
+    total = len(user_ids)
+    status = await bot.send_message(
+        admin_id, f"📡 بدأت الإذاعة إلى {total} مستخدم ⚡\n⏳ جارٍ الإرسال..."
+    )
+
+    sent, blocked, failed, done = 0, 0, 0, 0
+    batch_size = config.BROADCAST_BATCH_SIZE
+
+    try:
+        for i in range(0, total, batch_size):
+            batch = user_ids[i:i + batch_size]
+            started = time.monotonic()
+            results = await asyncio.gather(*[_send_one(bot, uid, source_message) for uid in batch])
+            sent += results.count("ok")
+            blocked += results.count("blocked")
+            failed += results.count("failed")
+            done += len(batch)
+
+            if (i // batch_size) % 5 == 4:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=admin_id,
+                        message_id=status.message_id,
+                        text=f"📡 جارٍ الإرسال... {done}/{total}\n✅ نجح: {sent}",
+                    )
+                except Exception:
+                    pass
+
+            elapsed = time.monotonic() - started
+            if elapsed < 1.0:
+                await asyncio.sleep(1.0 - elapsed)
+    except Exception as e:
+        logger.exception("خطأ أثناء الإذاعة: %s", e)
 
     await bot.send_message(
-        admin_id, f"✅ انتهت الإذاعة\n\nنجح الإرسال: {sent}\nفشل الإرسال: {failed}"
+        admin_id,
+        f"✅ انتهت الإذاعة\n\n"
+        f"👥 إجمالي المستخدمين: {total}\n"
+        f"✅ وصلت لـ: {sent}\n"
+        f"🚫 حظروا البوت: {blocked}\n"
+        f"❌ فشلت: {failed}",
     )
 
 
@@ -1185,4 +1230,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
