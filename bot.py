@@ -70,8 +70,8 @@ def _env_int(name: str, default: int) -> int:
 class config:
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
     ADMIN_ID = int(os.environ.get("ADMIN_ID", "9253474579"))
-    CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@@Zenox_Tols").strip()
-    CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/ZenoX_Tools").strip()
+    CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@Zenox_Tols").strip()
+    CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/Zenox_Tols").strip()
     PORT = int(os.environ.get("PORT", "10000"))
     DB_PATH = os.environ.get("DB_PATH", "bot_database.db")
 
